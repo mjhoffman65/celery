@@ -4,7 +4,7 @@ from kombu.utils.functional import lazy
 from celery.utils.functional import (DummyContext, first, firstmethod,
                                      fun_accepts_kwargs, fun_takes_argument,
                                      head_from_fun, maybe_list, mlazy,
-                                     padlist, regen, seq_concat_item,
+                                     padlist, lookahead, regen, seq_concat_item,
                                      seq_concat_seq)
 
 
@@ -65,6 +65,9 @@ def test_first():
     assert first(predicate, range(10, 20)) is None
     assert iterations[0] == 10
 
+def test_lookahead():
+    assert list(lookahead(x for x in range(6))) == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, None)]
+
 
 def test_maybe_list():
     assert maybe_list(1) == [1]
@@ -81,7 +84,71 @@ def test_mlazy():
     assert repr(p) == '20'
 
 
+@pytest.fixture
+def g():
+    return regen(iter(list(range(10))))
+
+
+def test_gen(g):
+    assert g[7] == 7
+    assert g[6] == 6
+    assert g[5] == 5
+    assert g[4] == 4
+    assert g[3] == 3
+    assert g[2] == 2
+    assert g[1] == 1
+    assert g[0] == 0
+    assert not g.fully_consumed()
+    assert g.data, list(range(10))
+    assert g.fully_consumed()
+    assert g[8] == 8
+    assert g[0] == 0
+    assert list(iter(g)) == list(range(10))
+
+
+def test_regen_gen_index_2(g):
+    assert g[0] == 0
+    assert g[1] == 1
+    assert g.data == list(range(10))
+
+
+def test_regen_gen_index_error(g):
+    assert g[0] == 0
+    with pytest.raises(IndexError):
+        g[11]
+    assert g.fully_consumed()
+    assert list(iter(g)) == list(range(10))
+
+
+def test_regen_gen_negative_index(g):
+    assert g[-1] == 9
+    assert g[-2] == 8
+    assert g[-3] == 7
+    assert g[-4] == 6
+    assert g[-5] == 5
+    assert g[5] == 5
+    assert g.data == list(range(10))
+
+    assert list(iter(g)) == list(range(10))
+
+def test_regen_gen_iter(g):
+    list(iter(g))
+    assert g.fully_consumed()
+    assert list(iter(g)) == list(range(10))
+
+def test_regen_gen_repr(g):
+    repr(g)
+    assert not g.fully_consumed()
+
+def test_regen_gen_nonzero(g):
+    bool(g)
+    assert not g.fully_consumed()
+
+
+
+
 class test_regen:
+
 
     def test_list(self):
         l = [1, 2]
@@ -94,39 +161,6 @@ class test_regen:
         fun, args = r.__reduce__()
         assert fun(*args) == l
 
-    def test_gen(self):
-        g = regen(iter(list(range(10))))
-        assert g[7] == 7
-        assert g[6] == 6
-        assert g[5] == 5
-        assert g[4] == 4
-        assert g[3] == 3
-        assert g[2] == 2
-        assert g[1] == 1
-        assert g[0] == 0
-        assert g.data, list(range(10))
-        assert g[8] == 8
-        assert g[0] == 0
-        g = regen(iter(list(range(10))))
-        assert g[0] == 0
-        assert g[1] == 1
-        assert g.data == list(range(10))
-        g = regen(iter([1]))
-        assert g[0] == 1
-        with pytest.raises(IndexError):
-            g[1]
-        assert g.data == [1]
-
-        g = regen(iter(list(range(10))))
-        assert g[-1] == 9
-        assert g[-2] == 8
-        assert g[-3] == 7
-        assert g[-4] == 6
-        assert g[-5] == 5
-        assert g[5] == 5
-        assert g.data == list(range(10))
-
-        assert list(iter(g)) == list(range(10))
 
 
 class test_head_from_fun:
