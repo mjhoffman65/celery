@@ -18,7 +18,7 @@ from celery.exceptions import ChordError, TimeoutError
 from celery.five import bytes_if_py2, items, range
 from celery.result import result_from_tuple
 from celery.utils import serialization
-from celery.utils.functional import pass1
+from celery.utils.functional import pass1, regen
 from celery.utils.serialization import UnpickleableExceptionWrapper
 from celery.utils.serialization import find_pickleable_exception as fnpe
 from celery.utils.serialization import get_pickleable_exception as gpe
@@ -169,26 +169,26 @@ class test_BaseBackend_interface:
 
     def test_apply_chord(self, unlock='celery.chord_unlock'):
         self.app.tasks[unlock] = Mock()
-        header_result = self.app.GroupResult(
+        header_result_args = (
             uuid(),
-            [self.app.AsyncResult(x) for x in range(3)],
+            regen(self.app.AsyncResult(x) for x in range(3)),
         )
-        self.b.apply_chord(header_result, self.callback.s())
+        self.b.apply_chord(header_result_args, self.callback.s())
         assert self.app.tasks[unlock].apply_async.call_count
 
     def test_chord_unlock_queue(self, unlock='celery.chord_unlock'):
         self.app.tasks[unlock] = Mock()
-        header_result = self.app.GroupResult(
+        header_result_args = (
             uuid(),
             [self.app.AsyncResult(x) for x in range(3)],
         )
         body = self.callback.s()
 
-        self.b.apply_chord(header_result, body)
+        self.b.apply_chord(header_result_args, body)
         called_kwargs = self.app.tasks[unlock].apply_async.call_args[1]
         assert called_kwargs['queue'] is None
 
-        self.b.apply_chord(header_result, body.set(queue='test_queue'))
+        self.b.apply_chord(header_result_args, body.set(queue='test_queue'))
         called_kwargs = self.app.tasks[unlock].apply_async.call_args[1]
         assert called_kwargs['queue'] == 'test_queue'
 
@@ -196,7 +196,7 @@ class test_BaseBackend_interface:
         def callback_queue(result):
             pass
 
-        self.b.apply_chord(header_result, callback_queue.s())
+        self.b.apply_chord(header_result_args, callback_queue.s())
         called_kwargs = self.app.tasks[unlock].apply_async.call_args[1]
         assert called_kwargs['queue'] == 'test_queue_two'
 

@@ -29,7 +29,7 @@ from celery.utils.collections import ChainMap
 from celery.utils.functional import _regen
 from celery.utils.functional import chunks as _chunks
 from celery.utils.functional import (is_list, maybe_list, regen,
-                                     seq_concat_item, seq_concat_seq)
+                                     lookahead, seq_concat_item, seq_concat_seq)
 from celery.utils.objects import getitem_property
 from celery.utils.text import remove_repeating_from_task, truncate
 
@@ -66,12 +66,6 @@ def maybe_unroll_group(group):
 
 def task_name_from(task):
     return getattr(task, 'name', task)
-
-
-def _upgrade(fields, sig):
-    """Used by custom signatures in .from_dict, to keep common fields."""
-    sig.update(chord_size=fields.get('chord_size'))
-    return sig
 
 
 @abstract.CallableSignature.register
@@ -175,7 +169,6 @@ class Signature(dict):
                 options=dict(options or {}, **ex),
                 subtask_type=subtask_type,
                 immutable=immutable,
-                chord_size=None,
             )
 
     def __call__(self, *partial_args, **partial_kwargs):
@@ -267,7 +260,6 @@ class Signature(dict):
                                          'kwargs': kwargs,
                                          'options': deepcopy(opts),
                                          'subtask_type': self.subtask_type,
-                                         'chord_size': self.chord_size,
                                          'immutable': self.immutable},
                                         app=self._app)
         signature._type = self._type
@@ -521,8 +513,6 @@ class Signature(dict):
     kwargs = getitem_property('kwargs', 'Keyword arguments to task.')
     options = getitem_property('options', 'Task execution options.')
     subtask_type = getitem_property('subtask_type', 'Type of signature')
-    chord_size = getitem_property(
-        'chord_size', 'Size of chord (if applicable)')
     immutable = getitem_property(
         'immutable', 'Flag set if no longer accepts new arguments')
 
@@ -596,7 +586,7 @@ class _chain(Signature):
             if isinstance(tasks, tuple):  # aaaargh
                 tasks = d['kwargs']['tasks'] = list(tasks)
             tasks = [maybe_signature(task, app=app) for task in tasks]
-        return _upgrade(d, _chain(tasks, app=app, **d['options']))
+        return _chain(tasks, app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         tasks = (regen(tasks[0]) if len(tasks) == 1 and is_list(tasks[0])
@@ -888,9 +878,7 @@ class _basemap(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return _upgrade(
-            d, cls(*cls._unpack_args(d['kwargs']), app=app, **d['options']),
-        )
+        return cls(*cls._unpack_args(d['kwargs']), app=app, **d['options'])
 
     def __init__(self, task, it, **options):
         Signature.__init__(
@@ -948,10 +936,7 @@ class chunks(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return _upgrade(
-            d, chunks(*cls._unpack_args(
-                d['kwargs']), app=app, **d['options']),
-        )
+        return chunks(*cls._unpack_args( d['kwargs']), app=app, **d['options'])
 
     def __init__(self, task, it, n, **options):
         Signature.__init__(
@@ -992,7 +977,7 @@ def _maybe_group(tasks, app):
     elif isinstance(tasks, abstract.CallableSignature):
         tasks = [tasks]
     else:
-        tasks = [signature(t, app=app) for t in tasks]
+        tasks = regen(signature(t, app=app) for t in tasks)
     return tasks
 
 
@@ -1032,9 +1017,7 @@ class group(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return _upgrade(
-            d, group(d['kwargs']['tasks'], app=app, **d['options']),
-        )
+        return group(d['kwargs']['tasks'], app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         if len(tasks) == 1:
@@ -1100,7 +1083,7 @@ class group(Signature):
         kwargs = kwargs if kwargs else {}
         app = self.app
         if not self.tasks:
-            return self.freeze()  # empty group returns GroupResult
+            return self.freeze()
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
         return app.GroupResult(group_id, [
@@ -1130,25 +1113,10 @@ class group(Signature):
                   CallableSignature=abstract.CallableSignature,
                   from_dict=Signature.from_dict,
                   isinstance=isinstance, tuple=tuple):
-        for task in tasks:
-            if isinstance(task, CallableSignature):
-                # local sigs are always of type Signature, and we
-                # clone them to make sure we don't modify the originals.
-                task = task.clone()
-            else:
-                # serialized sigs must be converted to Signature.
-                task = from_dict(task, app=app)
-            if isinstance(task, group):
-                # needs yield_from :(
-                unroll = task._prepared(
-                    task.tasks, partial_args, group_id, root_id, app,
-                )
-                for taskN, resN in unroll:
-                    yield taskN, resN
-            else:
-                if partial_args and not task.immutable:
-                    task.args = tuple(partial_args) + tuple(task.args)
-                yield task, task.freeze(group_id=group_id, root_id=root_id)
+        for task in self._unroll_tasks(tasks, app=app, clone=True):
+            if partial_args and not task.immutable:
+                task.args = tuple(partial_args) + tuple(task.args)
+            yield task, task.freeze(group_id=group_id, root_id=root_id)
 
     def _apply_tasks(self, tasks, producer=None, app=None, p=None,
                      add_to_parent=None, chord=None,
@@ -1157,9 +1125,15 @@ class group(Signature):
         #   XXX chord is also a class in outer scope.
         app = app or self.app
         with app.producer_or_acquire(producer) as producer:
-            for sig, res in tasks:
+            for count, (curr_task, next_task) in enumerate(lookahead(tasks)):
+                sig, res = curr_task
+                ichord = sig.options.get('chord') or chord
+                if ichord is not None and next_task is None:
+                    # last task in chord: set the length *before* applying
+                    app.backend.set_chord_size(sig.options['group_id'],
+                                               count+1)
                 sig.apply_async(producer=producer, add_to_parent=False,
-                                chord=sig.options.get('chord') or chord,
+                                chord=ichord,
                                 args=args, kwargs=kwargs,
                                 **options)
 
@@ -1182,8 +1156,8 @@ class group(Signature):
             options.pop('task_id', uuid()))
         return options, group_id, options.get('root_id')
 
-    def freeze(self, _id=None, group_id=None, chord=None,
-               root_id=None, parent_id=None):
+    def _freeze_group_tasks(self, group_id=None, chord=None,
+                            root_id=None, parent_id=None):
         # pylint: disable=redefined-outer-name
         #   XXX chord is also a class in outer scope.
         opts = self.options
@@ -1197,33 +1171,34 @@ class group(Signature):
             opts['chord'] = chord
         root_id = opts.setdefault('root_id', root_id)
         parent_id = opts.setdefault('parent_id', parent_id)
-        new_tasks = []
-        # Need to unroll subgroups early so that chord gets the
-        # right result instance for chord_unlock etc.
-        results = list(self._freeze_unroll(
-            new_tasks, group_id, chord, root_id, parent_id,
-        ))
-        if isinstance(self.tasks, MutableSequence):
-            self.tasks[:] = new_tasks
-        else:
-            self.tasks = new_tasks
-        return self.app.GroupResult(gid, results)
+        tasks1, tasks2 = itertools.tee(self._unroll_tasks(self.tasks, clone=True))
+        results = regen(
+            self._freeze_tasks(tasks1, group_id, chord, root_id, parent_id))
+        # if self.tasks is consumed, it will also populate the group results
+        self.tasks = regen(x[0] for x in zip(tasks2, results))
+        return gid, results
+
+    def freeze(self, _id=None, group_id=None, chord=None,
+               root_id=None, parent_id=None):
+        return self.app.GroupResult(*self._freeze_group_tasks(group_id=group_id, chord=chord, root_id=root_id, parent_id=parent_id))
 
     _freeze = freeze
 
-    def _freeze_unroll(self, new_tasks, group_id, chord, root_id, parent_id):
-        # pylint: disable=redefined-outer-name
-        #   XXX chord is also a class in outer scope.
-        stack = deque(self.tasks)
-        while stack:
-            task = maybe_signature(stack.popleft(), app=self._app).clone()
+    def _unroll_tasks(self, tasks, app=None, clone=True):
+        for task in tasks:
+            task = maybe_signature(task, app=app or self._app, clone=clone)
             if isinstance(task, group):
-                stack.extendleft(task.tasks)
+                it = task._unroll_tasks(task.tasks, app=app, clone=clone)
+                for subtask in it:
+                    yield maybe_signature(subtask, app=app or self._app, clone=clone)
             else:
-                new_tasks.append(task)
-                yield task.freeze(group_id=group_id,
-                                  chord=chord, root_id=root_id,
-                                  parent_id=parent_id)
+                yield task
+
+    def _freeze_tasks(self, tasks, group_id, chord, root_id, parent_id):
+        for task in tasks:
+            yield task.freeze(group_id=group_id,
+                              chord=chord, root_id=root_id,
+                              parent_id=parent_id)
 
     def __repr__(self):
         if self.tasks:
@@ -1279,7 +1254,7 @@ class chord(Signature):
     def from_dict(cls, d, app=None):
         options = d.copy()
         args, options['kwargs'] = cls._unpack_args(**options['kwargs'])
-        return _upgrade(d, cls(*args, app=app, **options))
+        return cls(*args, app=app, **options)
 
     @staticmethod
     def _unpack_args(header=None, body=None, **kwargs):
@@ -1360,29 +1335,12 @@ class chord(Signature):
             args=(tasks.apply(args, kwargs).get(propagate=propagate),),
         )
 
-    def _traverse_tasks(self, tasks, value=None):
-        stack = deque(tasks)
-        while stack:
-            task = stack.popleft()
-            if isinstance(task, group):
-                stack.extend(task.tasks)
-            elif isinstance(task, _chain) and isinstance(task.tasks[-1], group):
-                stack.extend(task.tasks[-1].tasks)
-            else:
-                yield task if value is None else value
-
-    def __length_hint__(self):
-        tasks = (self.tasks.tasks if isinstance(self.tasks, group)
-                 else self.tasks)
-        return sum(self._traverse_tasks(tasks, 1))
-
     def run(self, header, body, partial_args, app=None, interval=None,
             countdown=1, max_retries=None, eager=False,
             task_id=None, **options):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
-        body.chord_size = self.__length_hint__()
         options = dict(self.options, **options) if options else self.options
         if options:
             options.pop('task_id', None)
@@ -1396,21 +1354,23 @@ class chord(Signature):
         options.pop('chord', None)
         options.pop('task_id', None)
 
-        header_result = header.freeze(group_id=group_id, chord=body, root_id=root_id)
+        header_result_args = header._freeze_group_tasks(group_id=group_id, chord=body, root_id=root_id)
 
-        if len(header_result) > 0:
+        if header.tasks:
             app.backend.apply_chord(
-                header_result,
+                header_result_args,
                 body,
                 interval=interval,
                 countdown=countdown,
                 max_retries=max_retries,
             )
             header_result = header(*partial_args, task_id=group_id, **options)
+            self.app.GroupResult(*header_result_args)
         # The execution of a chord body is normally triggered by its header's
         # tasks completing. If the header is empty this will never happen, so
         # we execute the body manually here.
         else:
+            header_result = self.app.GroupResult(*header_result_args)
             body.delay([])
 
         bodyres.parent = header_result
@@ -1464,7 +1424,7 @@ class chord(Signature):
                 tasks = self.tasks.tasks  # is a group
             except AttributeError:
                 tasks = self.tasks
-            if len(tasks):
+            if tasks:
                 app = tasks[0]._app
             if app is None and body is not None:
                 app = body._app

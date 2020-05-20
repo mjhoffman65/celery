@@ -402,6 +402,9 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             raise ChordError('Dependency {0} raised {1!r}'.format(tid, retval))
         return retval
 
+    def set_chord_size(self, group_id, chord_size):
+        self.set(self.get_key_for_group(group_id, '.s'), chord_size)
+
     def apply_chord(self, header_result, body, **kwargs):
         # Overrides this to avoid calling GroupResult.save
         # pylint: disable=method-hidden
@@ -420,25 +423,31 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         client = self.client
         jkey = self.get_key_for_group(gid, '.j')
         tkey = self.get_key_for_group(gid, '.t')
+        skey = self.get_key_for_group(gid, '.s')
         result = self.encode_result(result, state)
         with client.pipeline() as pipe:
             pipeline = pipe \
                 .rpush(jkey, self.encode([1, tid, state, result])) \
                 .llen(jkey) \
-                .get(tkey)
+                .get(tkey) \
+                .get(skey)
 
             if self.expires is not None:
                 pipeline = pipeline \
                     .expire(jkey, self.expires) \
-                    .expire(tkey, self.expires)
+                    .expire(tkey, self.expires) \
+                    .expire(skey, self.expires)
 
-            _, readycount, totaldiff = pipeline.execute()[:3]
+            _, readycount, totaldiff, total = pipeline.execute()[:4]
 
-        totaldiff = int(totaldiff or 0)
+        if total is None:
+            # chord is not completely submitted yet
+            return
+
+        total = int(total) + int(totaldiff or 0)
 
         try:
             callback = maybe_signature(request.chord, app=app)
-            total = callback['chord_size'] + totaldiff
             if readycount == total:
                 decode, unpack = self.decode, self._unpack_chord_result
                 with client.pipeline() as pipe:
@@ -448,9 +457,10 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 try:
                     callback.delay([unpack(tup, decode) for tup in resl])
                     with client.pipeline() as pipe:
-                        _, _ = pipe \
+                        _, _, _ = pipe \
                             .delete(jkey) \
                             .delete(tkey) \
+                            .delete(skey) \
                             .execute()
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception(
