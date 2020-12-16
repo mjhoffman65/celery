@@ -401,6 +401,9 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             raise ChordError(f'Dependency {tid} raised {retval!r}')
         return retval
 
+    def set_chord_size(self, group_id, chord_size):
+        self.set(self.get_key_for_group(group_id, '.s'), chord_size)
+
     def apply_chord(self, header_result, body, **kwargs):
         # If any of the child results of this chord are complex (ie. group
         # results themselves), we need to save `header_result` to ensure that
@@ -431,6 +434,7 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         client = self.client
         jkey = self.get_key_for_group(gid, '.j')
         tkey = self.get_key_for_group(gid, '.t')
+        skey = self.get_key_for_group(gid, '.s')
         result = self.encode_result(result, state)
         encoded = self.encode([1, tid, state, result])
         with client.pipeline() as pipe:
@@ -438,19 +442,20 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 pipe.zadd(jkey, {encoded: group_index}).zcount(jkey, "-inf", "+inf")
                 if self._chord_zset
                 else pipe.rpush(jkey, encoded).llen(jkey)
-            ).get(tkey)
+            ).get(tkey).get(skey)
             if self.expires:
                 pipeline = pipeline \
                     .expire(jkey, self.expires) \
-                    .expire(tkey, self.expires)
+                    .expire(tkey, self.expires) \
+                    .expire(skey, self.expires)
 
-            _, readycount, totaldiff = pipeline.execute()[:3]
+            _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
 
         totaldiff = int(totaldiff or 0)
 
         try:
             callback = maybe_signature(request.chord, app=app)
-            total = callback['chord_size'] + totaldiff
+            total = int(chord_size_bytes) + totaldiff
             if readycount == total:
                 header_result = GroupResult.restore(gid)
                 if header_result is not None:
@@ -493,9 +498,10 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                     )
                 finally:
                     with client.pipeline() as pipe:
-                        _, _ = pipe \
+                        pipe \
                             .delete(jkey) \
                             .delete(tkey) \
+                            .delete(skey) \
                             .execute()
         except ChordError as exc:
             logger.exception('Chord %r raised: %r', request.group, exc)

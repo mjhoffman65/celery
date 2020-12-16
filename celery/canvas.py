@@ -56,12 +56,6 @@ def task_name_from(task):
     return getattr(task, 'name', task)
 
 
-def _upgrade(fields, sig):
-    """Used by custom signatures in .from_dict, to keep common fields."""
-    sig.update(chord_size=fields.get('chord_size'))
-    return sig
-
-
 @abstract.CallableSignature.register
 class Signature(dict):
     """Task Signature.
@@ -165,7 +159,6 @@ class Signature(dict):
                 options=dict(options or {}, **ex),
                 subtask_type=subtask_type,
                 immutable=immutable,
-                chord_size=None,
             )
 
     def __call__(self, *partial_args, **partial_kwargs):
@@ -265,7 +258,6 @@ class Signature(dict):
                                          'kwargs': kwargs,
                                          'options': deepcopy(opts),
                                          'subtask_type': self.subtask_type,
-                                         'chord_size': self.chord_size,
                                          'immutable': self.immutable},
                                         app=self._app)
         signature._type = self._type
@@ -530,8 +522,6 @@ class Signature(dict):
     kwargs = getitem_property('kwargs', 'Keyword arguments to task.')
     options = getitem_property('options', 'Task execution options.')
     subtask_type = getitem_property('subtask_type', 'Type of signature')
-    chord_size = getitem_property(
-        'chord_size', 'Size of chord (if applicable)')
     immutable = getitem_property(
         'immutable', 'Flag set if no longer accepts new arguments')
 
@@ -604,7 +594,7 @@ class _chain(Signature):
             if isinstance(tasks, tuple):  # aaaargh
                 tasks = d['kwargs']['tasks'] = list(tasks)
             tasks = [maybe_signature(task, app=app) for task in tasks]
-        return _upgrade(d, _chain(tasks, app=app, **d['options']))
+        return _chain(tasks, app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         tasks = (regen(tasks[0]) if len(tasks) == 1 and is_list(tasks[0])
@@ -908,9 +898,7 @@ class _basemap(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return _upgrade(
-            d, cls(*cls._unpack_args(d['kwargs']), app=app, **d['options']),
-        )
+        return cls(*cls._unpack_args(d['kwargs']), app=app, **d['options'])
 
     def __init__(self, task, it, **options):
         Signature.__init__(
@@ -964,10 +952,7 @@ class chunks(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return _upgrade(
-            d, chunks(*cls._unpack_args(
-                d['kwargs']), app=app, **d['options']),
-        )
+        return chunks(*cls._unpack_args(d['kwargs']), app=app, **d['options'])
 
     def __init__(self, task, it, n, **options):
         Signature.__init__(
@@ -1055,9 +1040,7 @@ class group(Signature):
         d["kwargs"]["tasks"] = rebuilt_tasks = type(orig_tasks)((
             maybe_signature(task, app=app) for task in orig_tasks
         ))
-        return _upgrade(
-            d, group(rebuilt_tasks, app=app, **d['options']),
-        )
+        return group(rebuilt_tasks, app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         if len(tasks) == 1:
@@ -1305,7 +1288,7 @@ class chord(Signature):
     def from_dict(cls, d, app=None):
         options = d.copy()
         args, options['kwargs'] = cls._unpack_args(**options['kwargs'])
-        return _upgrade(d, cls(*args, app=app, **options))
+        return cls(*args, app=app, **options)
 
     @staticmethod
     def _unpack_args(header=None, body=None, **kwargs):
@@ -1422,7 +1405,7 @@ class chord(Signature):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
-        body.chord_size = self.__length_hint__()
+        app.backend.set_chord_size(group_id, self.__length_hint__())
         options = dict(self.options, **options) if options else self.options
         if options:
             options.pop('task_id', None)

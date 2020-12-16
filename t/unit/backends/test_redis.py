@@ -295,7 +295,7 @@ class basetest_RedisBackend:
         self.app.tasks['foobarbaz'] = task
         task.request.chord = signature(task)
         task.request.id = tid
-        task.request.chord['chord_size'] = 10
+        self.b.set_chord_size(group_id, 10)
         task.request.group = group_id
         task.request.group_index = i
         return task
@@ -305,7 +305,8 @@ class basetest_RedisBackend:
         with patch('celery.backends.redis.maybe_signature') as ms:
             request = Mock(name='request')
             request.id = 'id1'
-            request.group = 'gid1'
+            group_id = 'gid1'
+            request.group = group_id
             request.group_index = None
             tasks = [
                 self.create_task(i, group_id=request.group)
@@ -313,7 +314,7 @@ class basetest_RedisBackend:
             ]
             callback = ms.return_value = Signature('add')
             callback.id = 'id1'
-            callback['chord_size'] = size
+            self.b.set_chord_size(group_id, size)
             callback.delay = Mock(name='callback.delay')
             yield tasks, request, callback
 
@@ -639,6 +640,12 @@ class test_RedisBackend(basetest_RedisBackend):
         b.add_to_chord(gid, 'sig')
         b.client.incr.assert_called_with(b.get_key_for_group(gid, '.t'), 1)
 
+    def test_set_chord_size(self):
+        b = self.Backend('redis://', app=self.app)
+        gid = uuid()
+        b.set_chord_size(gid, 10)
+        b.client.set.assert_called_with(b.get_key_for_group(gid, '.s'), 10)
+
     def test_expires_is_None(self):
         b = self.Backend(expires=None, app=self.app)
         assert b.expires == self.app.conf.result_expires.total_seconds()
@@ -695,9 +702,10 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         assert self.b.client.zrangebyscore.call_count
         jkey = self.b.get_key_for_group('group_id', '.j')
         tkey = self.b.get_key_for_group('group_id', '.t')
-        self.b.client.delete.assert_has_calls([call(jkey), call(tkey)])
+        skey = self.b.get_key_for_group('group_id', '.s')
+        self.b.client.delete.assert_has_calls([call(jkey), call(tkey), call(skey)])
         self.b.client.expire.assert_has_calls([
-            call(jkey, 86400), call(tkey, 86400),
+            call(jkey, 86400), call(tkey, 86400), call(skey, 86400),
         ])
 
     def test_on_chord_part_return__unordered(self):
@@ -744,6 +752,7 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         old_expires = self.b.expires
         self.b.expires = None
         tasks = [self.create_task(i) for i in range(10)]
+        self.b.set_chord_size('group_id', 10)
 
         for i in range(10):
             self.b.on_chord_part_return(tasks[i].request, states.SUCCESS, i)
@@ -884,8 +893,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, ChordError())
-            self.b.client.pipeline.return_value.zadd().zcount().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
@@ -900,8 +909,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, ChordError())
-            self.b.client.pipeline.return_value.rpush().llen().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.rpush().llen().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
@@ -916,8 +925,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, ChordError())
-            self.b.client.pipeline.return_value.zadd().zcount().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
@@ -928,8 +937,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, RuntimeError())
-            self.b.client.pipeline.return_value.zadd().zcount().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
@@ -944,8 +953,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, RuntimeError())
-            self.b.client.pipeline.return_value.rpush().llen().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.rpush().llen().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
@@ -960,8 +969,8 @@ class test_RedisBackend_chords_simple(basetest_RedisBackend):
         with self.chord_context(1) as (_, request, callback):
             self.b.client.pipeline = ContextMock()
             raise_on_second_call(self.b.client.pipeline, RuntimeError())
-            self.b.client.pipeline.return_value.zadd().zcount().get().expire(
-            ).expire().execute.return_value = (1, 1, 0, 4, 5)
+            self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
             task = self.app._tasks['add'] = Mock(name='add_task')
             self.b.on_chord_part_return(request, states.SUCCESS, 10)
             task.backend.fail_from_current_stack.assert_called_with(
