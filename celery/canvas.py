@@ -993,7 +993,7 @@ def _maybe_group(tasks, app):
     elif isinstance(tasks, abstract.CallableSignature):
         tasks = [tasks]
     else:
-        tasks = [signature(t, app=app) for t in tasks]
+        tasks = regen(signature(t, app=app) for t in tasks)
     return tasks
 
 
@@ -1487,7 +1487,7 @@ class chord(Signature):
                 tasks = self.tasks.tasks  # is a group
             except AttributeError:
                 tasks = self.tasks
-            if len(tasks):
+            if tasks:
                 app = tasks[0]._app
             if app is None and body is not None:
                 app = body._app
