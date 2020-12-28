@@ -25,7 +25,7 @@ from celery.utils import abstract
 from celery.utils.collections import ChainMap
 from celery.utils.functional import _regen
 from celery.utils.functional import chunks as _chunks
-from celery.utils.functional import (is_list, maybe_list, regen,
+from celery.utils.functional import (is_list, maybe_list, lookahead, regen,
                                      seq_concat_item, seq_concat_seq)
 from celery.utils.objects import getitem_property
 from celery.utils.text import remove_repeating_from_task, truncate
@@ -1110,7 +1110,7 @@ class group(Signature):
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
         return app.GroupResult(group_id, [
-            sig.apply(args=args, kwargs=kwargs, **options) for sig, _ in tasks
+            sig.apply(args=args, kwargs=kwargs, **options) for sig, _, _ in tasks
         ])
 
     def set_immutable(self, immutable):
@@ -1153,7 +1153,7 @@ class group(Signature):
             else:
                 if partial_args and not task.immutable:
                     task.args = tuple(partial_args) + tuple(task.args)
-                yield task, task.freeze(group_id=group_id, root_id=root_id)
+                yield task, task.freeze(group_id=group_id, root_id=root_id), group_id
 
     def _apply_tasks(self, tasks, producer=None, app=None, p=None,
                      add_to_parent=None, chord=None,
@@ -1162,12 +1162,22 @@ class group(Signature):
         #   XXX chord is also a class in outer scope.
         app = app or self.app
         with app.producer_or_acquire(producer) as producer:
-            for sig, res in tasks:
+            for task_index, (current_task, next_task) in enumerate(
+                lookahead(tasks)
+            ):
+                sig, res, group_id = current_task
+                _chord = sig.options.get("chord") or chord
+                if _chord is not None and next_task is None:
+                    chord_length = task_index + 1
+                    if isinstance(sig, _chain):
+                        if sig.tasks[-1].subtask_type == 'chord':
+                            chord_length = sig.tasks[-1].__length_hint__()
+                        else:
+                            chord_length = task_index + len(sig.tasks[-1])
+                    app.backend.set_chord_size(group_id, chord_length)
                 sig.apply_async(producer=producer, add_to_parent=False,
-                                chord=sig.options.get('chord') or chord,
-                                args=args, kwargs=kwargs,
+                                chord=_chord, args=args, kwargs=kwargs,
                                 **options)
-
                 # adding callback to result, such that it will gradually
                 # fulfill the barrier.
                 #
@@ -1405,7 +1415,6 @@ class chord(Signature):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
-        app.backend.set_chord_size(group_id, self.__length_hint__())
         options = dict(self.options, **options) if options else self.options
         if options:
             options.pop('task_id', None)
